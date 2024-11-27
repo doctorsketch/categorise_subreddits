@@ -119,6 +119,8 @@ def create_prompt(subreddit: str, top_data: dict, about_data: dict, categories: 
     
     description = about_data.get('data', {}).get('public_description', '')
     title = about_data.get('data', {}).get('title', '')
+    subscribers = about_data.get('data', {}).get('subscribers', 'N/A')
+    created_utc = about_data.get('data', {}).get('created_utc', 'N/A')
     
     top_posts = []
     try:
@@ -130,28 +132,24 @@ def create_prompt(subreddit: str, top_data: dict, about_data: dict, categories: 
     # Format existing subcategories as a numbered list
     existing_subcats = '\n'.join(f"{i+1}. {cat}" for i, cat in enumerate(categories['third_column']))
 
-    prompt = f"""Analyze this subreddit and categorize it:
+    prompt = f"""Analyze this subreddit and respond ONLY with these three lines, no other text:
 
-SUBREDDIT INFO:
-Name: r/{subreddit}
+MAIN_CATEGORY: <pick one: {', '.join(categories['second_column'])}>
+SUB_CATEGORY: <use number from list or NEW:suggestion>
+SPECIALIST: <specific topic or blank>
+
+Subreddit Info:
+r/{subreddit}
 Title: {title}
 Description: {description}
+Subscribers: {subscribers}
+Created: {created_utc}
 
-TOP POSTS:
+Top Posts:
 {chr(10).join('- ' + post for post in top_posts)}
 
-TASK:
-1. Choose ONE main category from this list:
-{', '.join(categories['second_column'])}
-
-2. For the subcategory, FIRST check if any of these existing subcategories fit:
-{existing_subcats}
-
-If none of the existing subcategories fit well, suggest a NEW one that's concise and follows the same style.
-
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
-MAIN_CATEGORY: <category>
-SUB_CATEGORY: <existing_number or NEW:suggested_category>"""
+Available subcategories:
+{existing_subcats}"""
 
     return prompt
 
@@ -163,64 +161,97 @@ def update_subcategories(new_subcategory: str, categories: Dict[str, List[str]])
             json.dump(categories, f, indent=2)
         print(f"Added new subcategory: {new_subcategory}")
 
-def get_llm_categorization(prompt: str, about_data: dict, categories: Dict[str, List[str]]) -> Tuple[str, str]:
-    """Get categorization from LLM and handle subcategory updates"""
-    if about_data.get('data', {}).get('over_18', False):
-        return "Adult and NSFW", ""
-        
-    try:
-        formatted_prompt = f"""<|system|>
-You are a helpful assistant that categorizes subreddits accurately and concisely.
+async def process_llm_batch(prompts_data: List[Tuple[str, dict, dict, str]], categories: Dict[str, List[str]]) -> List[Tuple[str, str, str, str]]:
+    """Process multiple LLM queries concurrently"""
+    async def process_single_prompt(prompt_data):
+        subreddit, prompt, about_data = prompt_data
+        if not prompt:  # Handle None prompts (e.g., NSFW)
+            return subreddit, "Adult and NSFW", "", ""
+            
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                client = openai.AsyncOpenAI(
+                    base_url="http://x9dri.local:8080/v1",
+                    api_key="dummy"
+                )
+                
+                formatted_prompt = f"""<|system|>
+You are a categorization assistant. Respond ONLY with the three required lines. No explanations or additional text.
 <|end|>
 <|user|>
 {prompt}
 <|end|>
 <|assistant|>"""
-
-        # Updated to use new OpenAI API format
-        client = openai.OpenAI(
-            base_url="http://x9dri.local:8080/v1",
-            api_key="dummy"
-        )
-        
-        response = client.chat.completions.create(
-            model="local-model",
-            messages=[
-                {"role": "user", "content": formatted_prompt}
-            ],
-            temperature=0.1,  # Lower temperature for more consistent categorization
-            max_tokens=100,
-            stop=["<|end|>"]  # Add explicit stop token
-        )
-        
-        result = response.choices[0].message.content.strip()
-        
-        # Parse the response
-        main_category = ""
-        sub_category = ""
-        
-        for line in result.split('\n'):
-            if line.startswith('MAIN_CATEGORY:'):
-                main_category = line.split(':')[1].strip()
-            elif line.startswith('SUB_CATEGORY:'):
-                sub_value = line.split(':')[1].strip()
                 
-                # Handle numbered existing category
-                if sub_value.split('.')[0].isdigit():
-                    index = int(sub_value.split('.')[0]) - 1
-                    if 0 <= index < len(categories['third_column']):
-                        sub_category = categories['third_column'][index]
-                # Handle new category suggestion
-                elif sub_value.startswith('NEW:'):
-                    new_sub = sub_value.replace('NEW:', '').strip()
-                    update_subcategories(new_sub, categories)
-                    sub_category = new_sub
+                response = await client.chat.completions.create(
+                    model="local-model",
+                    messages=[{"role": "user", "content": formatted_prompt}],
+                    temperature=0.1,
+                    max_tokens=100,
+                    stop=["<|end|>"]
+                )
+                
+                # Clean up the response more strictly
+                result = response.choices[0].message.content.strip()
+                
+                # Only take lines that start with our expected prefixes and are properly formatted
+                valid_lines = []
+                for line in result.split('\n'):
+                    line = line.strip()
+                    if any(line.startswith(prefix) for prefix in ['MAIN_CATEGORY:', 'SUB_CATEGORY:', 'SPECIALIST:']):
+                        # Verify the line has a colon and content after it
+                        if ':' in line and line.split(':', 1)[1].strip():
+                            valid_lines.append(line)
+                
+                if len(valid_lines) == 3:
+                    main_category = ""
+                    sub_category = ""
+                    specialist = ""
+                    
+                    for line in valid_lines:
+                        prefix, value = line.split(':', 1)
+                        value = value.strip()
+                        
+                        if prefix == 'MAIN_CATEGORY':
+                            main_category = value
+                        elif prefix == 'SUB_CATEGORY':
+                            if value.split('.')[0].isdigit():
+                                index = int(value.split('.')[0]) - 1
+                                if 0 <= index < len(categories['third_column']):
+                                    sub_category = categories['third_column'][index]
+                            elif value.startswith('NEW:'):
+                                new_sub = value.replace('NEW:', '').strip()
+                                update_subcategories(new_sub, categories)
+                                sub_category = new_sub
+                            elif value.lower() in ['-', 'blank', 'none', 'n/a']:
+                                sub_category = ''
+                            else:
+                                sub_category = value
+                        elif prefix == 'SPECIALIST':
+                            if value.lower() not in ['-', 'blank', 'none', 'n/a']:
+                                specialist = value
+                    
+                    # Clean up any remaining explanations or parentheticals
+                    main_category = main_category.split('(')[0].strip()
+                    sub_category = sub_category.split('(')[0].strip()
+                    specialist = specialist.split('(')[0].strip()
+                    
+                    return subreddit, main_category, sub_category, specialist
+                
+                else:
+                    print(f"Invalid response format for r/{subreddit} on attempt {attempt + 1}. Retrying...")
+            
+            except Exception as e:
+                print(f"Error processing r/{subreddit} on attempt {attempt + 1}: {e}")
         
-        return main_category, sub_category
-    
-    except Exception as e:
-        print(f"Error getting LLM categorization: {e}")
-        return None, None
+        print(f"Failed to get valid response for r/{subreddit} after {max_retries} attempts.")
+        return subreddit, None, None, None
+
+    # Process all prompts concurrently
+    tasks = [process_single_prompt((subreddit, prompt, about_data)) 
+            for subreddit, prompt, about_data in prompts_data]
+    return await asyncio.gather(*tasks)
 
 async def process_batch(reddit_api: RedditAPI, batch: List[str], categories: dict) -> dict:
     """Process a batch of subreddits concurrently"""
@@ -230,29 +261,33 @@ async def process_batch(reddit_api: RedditAPI, batch: List[str], categories: dic
         data_tasks = [get_reddit_data_async(reddit_api, session, subreddit) for subreddit in batch]
         results = await asyncio.gather(*data_tasks)
         
-        # Process results with LLM
+        # Prepare prompts for all valid results
+        prompts_data = []
         for subreddit, (top_data, about_data, rate_limits) in zip(batch, results):
             if not top_data or not about_data:
                 continue
-            
+                
             last_rate_limits = rate_limits
-            print(f"Processing r/{subreddit}...")
+            print(f"Preparing prompt for r/{subreddit}...")
             prompt = create_prompt(subreddit, top_data, about_data, categories)
-            main_category, sub_category = get_llm_categorization(prompt, about_data, categories)
-            
-            if main_category and sub_category:
-                # Modified file opening to handle Unicode
+            prompts_data.append((subreddit, prompt, about_data))
+        
+        # Process all LLM queries concurrently
+        llm_results = await process_llm_batch(prompts_data, categories)
+        
+        # Write results to CSV
+        for subreddit, main_category, sub_category, specialist in llm_results:
+            if main_category:
                 with open('categorised.csv', 'a', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
-                    writer.writerow([subreddit, main_category, sub_category] + [''] * 5)
-                print(f"Categorized r/{subreddit} as {main_category} / {sub_category}")
+                    writer.writerow([subreddit, main_category, sub_category, specialist] + [''] * 4)
+                print(f"Categorized r/{subreddit} as {main_category} / {sub_category} / {specialist}")
         
         return last_rate_limits
 
 async def main_async():
     start_time = time.time()
     processed_count = 0
-    error_count = 0
     
     # Load categories
     categories = load_categories()
@@ -267,8 +302,10 @@ async def main_async():
     total_subs = len(subreddits)
     print(f"\nStarting processing of {total_subs} subreddits...")
     
-    # Process subreddits in batches
-    batch_size = 8
+    # Increase batch size significantly
+    batch_size = 8  # Increased from 8
+    
+    # Process subreddits in larger batches
     for i in range(0, len(subreddits), batch_size):
         batch = subreddits[i:i + batch_size]
         rate_limits = await process_batch(reddit_api, batch, categories)
@@ -292,7 +329,8 @@ async def main_async():
             print(f"Official Reset in: {rate_limits['reset']} seconds")
         print("-" * 50)
         
-        await asyncio.sleep(0.2)  # Rate limiting between batches
+        # Reduced sleep time between batches
+        await asyncio.sleep(0.1)  # Reduced from 0.2
 
 def main():
     """Entry point that runs the async main function"""
