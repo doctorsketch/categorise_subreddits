@@ -15,8 +15,8 @@ from datetime import timedelta
 load_dotenv()
 
 # Configure OpenAI-compatible endpoint
-openai.api_base = "http://x9dri.local:8080/v1"  # Adjust if your llama.cpp server is on a different port
-openai.api_key = "dummy"  # llama.cpp doesn't need a real key
+openai.api_base = "https://api.mistral.ai/v1"
+openai.api_key = os.getenv("MISTRAL_API_KEY")
 
 class RedditAPI:
     def __init__(self):
@@ -128,9 +128,8 @@ def create_prompt(subreddit: str, top_data: dict, about_data: dict, categories: 
     except:
         pass
 
-    # Format existing subcategories as a numbered list with descriptions
-    existing_subcats = '\n'.join(f"{i+1}. {cat} - Choose this for topics about {cat.lower()}" 
-                                for i, cat in enumerate(categories['third_column']))
+    # Format existing subcategories as a simple list without numbers
+    existing_subcats = '\n'.join(f"- {cat}" for cat in categories['third_column'])
 
     prompt = f"""You are a subreddit categorization expert. Your task is to accurately categorize the subreddit based on its ACTUAL CONTENT, not superficial similarities.
 
@@ -153,12 +152,12 @@ Recent Content Examples:
 Available Main Categories (pick ONE):
 {', '.join(categories['second_column'])}
 
-Available Subcategories (use number or suggest NEW):
+Available Subcategories (select one or suggest NEW):
 {existing_subcats}
 
 Respond ONLY with these three lines:
 MAIN_CATEGORY: <select from available main categories>
-SUB_CATEGORY: <use number from list OR write NEW:suggested_category>
+SUB_CATEGORY: <select from list OR write NEW:suggested_category>
 SPECIALIST: <specific focus area or if not enough info available you can leave this blank>
 
 Remember: Focus on ACTUAL content themes, not metaphorical similarities!"""
@@ -174,133 +173,42 @@ def update_subcategories(new_subcategory: str, categories: Dict[str, List[str]])
         print(f"Added new subcategory: {new_subcategory}")
 
 async def process_llm_batch(prompts_data: List[Tuple[str, dict, dict, str]], categories: Dict[str, List[str]]) -> List[Tuple[str, str, str, str]]:
-    """Process multiple LLM queries concurrently using a semaphore to control concurrency"""
+    """Process LLM queries one at a time"""
+    results = []
     
-    # Create a semaphore to limit concurrent LLM requests
-    semaphore = asyncio.Semaphore(8)  # Allow 8 concurrent LLM requests
+    for prompt_data in prompts_data:
+        # Process one prompt at a time
+        result = await process_single_prompt(prompt_data, categories)
+        results.append(result)
+        # Respect Mistral's 1 request per second limit
+        await asyncio.sleep(1.1)  # Slightly over 1 second to be safe
     
-    async def process_single_prompt(prompt_data):
-        async with semaphore:  # This ensures we don't exceed our concurrent request limit
-            subreddit, prompt, about_data = prompt_data
-            if not prompt:  # Handle None prompts (e.g., NSFW)
-                return subreddit, "Adult and NSFW", "", ""
-                
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    # Create client inside the function to ensure thread safety
-                    client = openai.AsyncOpenAI(
-                        base_url="http://x9dri.local:8080/v1",
-                        api_key="dummy"
-                    )
-                    
-                    formatted_prompt = f"""<|system|>
-You are a categorization assistant. Respond ONLY with the three required lines. No explanations or additional text.
-<|end|>
-<|user|>
-{prompt}
-<|end|>
-<|assistant|>"""
-                    
-                    # Use asyncio.create_task to run the API call asynchronously
-                    response = await client.chat.completions.create(
-                        model="local-model",
-                        messages=[{"role": "user", "content": formatted_prompt}],
-                        temperature=0.1,
-                        max_tokens=100,
-                        stop=["<|end|>"]
-                    )
-                    
-                    # Clean up the response more strictly
-                    result = response.choices[0].message.content.strip()
-                    
-                    # Only take lines that start with our expected prefixes and are properly formatted
-                    valid_lines = []
-                    for line in result.split('\n'):
-                        line = line.strip()
-                        if any(line.startswith(prefix) for prefix in ['MAIN_CATEGORY:', 'SUB_CATEGORY:', 'SPECIALIST:']):
-                            # Verify the line has a colon and content after it
-                            if ':' in line and line.split(':', 1)[1].strip():
-                                valid_lines.append(line)
-                    
-                    if len(valid_lines) == 3:
-                        main_category = ""
-                        sub_category = ""
-                        specialist = ""
-                        
-                        for line in valid_lines:
-                            prefix, value = line.split(':', 1)
-                            value = value.strip()
-                            
-                            if prefix == 'MAIN_CATEGORY':
-                                main_category = value
-                            elif prefix == 'SUB_CATEGORY':
-                                if value.split('.')[0].isdigit():
-                                    index = int(value.split('.')[0]) - 1
-                                    if 0 <= index < len(categories['third_column']):
-                                        sub_category = categories['third_column'][index]
-                                elif value.startswith('NEW:'):
-                                    new_sub = value.replace('NEW:', '').strip()
-                                    update_subcategories(new_sub, categories)
-                                    sub_category = new_sub
-                                elif value.lower() in ['-', 'blank', 'none', 'n/a']:
-                                    sub_category = ''
-                                else:
-                                    sub_category = value
-                            elif prefix == 'SPECIALIST':
-                                if value.lower() not in ['-', 'blank', 'none', 'n/a']:
-                                    specialist = value
-                        
-                        # Clean up any remaining explanations or parentheticals
-                        main_category = main_category.split('(')[0].strip()
-                        sub_category = sub_category.split('(')[0].strip()
-                        specialist = specialist.split('(')[0].strip()
-                        
-                        return subreddit, main_category, sub_category, specialist
-                    
-                    else:
-                        print(f"Invalid response format for r/{subreddit} on attempt {attempt + 1}. Retrying...")
-                
-                except Exception as e:
-                    print(f"Error processing r/{subreddit} on attempt {attempt + 1}: {e}")
-            
-            print(f"Failed to get valid response for r/{subreddit} after {max_retries} attempts.")
-            return subreddit, None, None, None
-
-    # Create tasks for all prompts simultaneously
-    tasks = [asyncio.create_task(process_single_prompt(data)) for data in prompts_data]
-    
-    # Wait for all tasks to complete
-    return await asyncio.gather(*tasks)
+    return results
 
 async def process_batch(reddit_api: RedditAPI, batch: List[str], categories: dict) -> dict:
-    """Process a batch of subreddits concurrently"""
+    """Process subreddits one at a time"""
     last_rate_limits = None
     async with aiohttp.ClientSession() as session:
-        # Fetch Reddit data for all subreddits in batch
-        data_tasks = [get_reddit_data_async(reddit_api, session, subreddit) for subreddit in batch]
-        results = await asyncio.gather(*data_tasks)
-        
-        # Prepare prompts for all valid results
-        prompts_data = []
-        for subreddit, (top_data, about_data, rate_limits) in zip(batch, results):
+        results = []
+        for subreddit in batch:
+            # Fetch Reddit data for one subreddit
+            top_data, about_data, rate_limits = await get_reddit_data_async(reddit_api, session, subreddit)
+            
             if not top_data or not about_data:
                 continue
                 
             last_rate_limits = rate_limits
             print(f"Preparing prompt for r/{subreddit}...")
             prompt = create_prompt(subreddit, top_data, about_data, categories)
-            prompts_data.append((subreddit, prompt, about_data))
-        
-        # Process all LLM queries truly concurrently
-        llm_results = await process_llm_batch(prompts_data, categories)
-        
-        # Write results to CSV using a thread-safe approach
-        async with aiohttp.ClientSession() as session:  # New session for file operations
-            for subreddit, main_category, sub_category, specialist in llm_results:
-                if main_category:
-                    # Use asyncio.to_thread for file operations to prevent blocking
-                    await asyncio.to_thread(write_to_csv, subreddit, main_category, sub_category, specialist)
+            
+            # Process one LLM query
+            llm_result = await process_llm_batch([(subreddit, prompt, about_data)], categories)
+            results.extend(llm_result)
+            
+            # Write result to CSV
+            for result in llm_result:
+                if result[1]:  # if main_category exists
+                    await asyncio.to_thread(write_to_csv, *result)
         
         return last_rate_limits
 
@@ -328,10 +236,9 @@ async def main_async():
     total_subs = len(subreddits)
     print(f"\nStarting processing of {total_subs} subreddits...")
     
-    # Increase batch size significantly
-    batch_size = 1  # Increased from 8
+    # Process one subreddit at a time
+    batch_size = 1
     
-    # Process subreddits in larger batches
     for i in range(0, len(subreddits), batch_size):
         batch = subreddits[i:i + batch_size]
         rate_limits = await process_batch(reddit_api, batch, categories)
@@ -355,12 +262,121 @@ async def main_async():
             print(f"Official Reset in: {rate_limits['reset']} seconds")
         print("-" * 50)
         
-        # Reduced sleep time between batches
-        await asyncio.sleep(0.1)  # Reduced from 0.2
+        # Reduced delay between subreddits
+        await asyncio.sleep(1.1)  # Slightly over 1 second to be safe
 
 def main():
     """Entry point that runs the async main function"""
     asyncio.run(main_async())
+
+async def process_single_prompt(prompt_data, categories):
+    """Process a single LLM prompt"""
+    subreddit, prompt, about_data = prompt_data
+    if not prompt:
+        return subreddit, "Adult and NSFW", "", ""
+        
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            client = openai.AsyncOpenAI(
+                base_url="https://api.mistral.ai/v1",
+                api_key=os.getenv("MISTRAL_API_KEY")
+            )
+            
+            formatted_prompt = f"""<|system|>
+You are a categorization assistant. Respond ONLY with the three required lines. No explanations or additional text.
+<|end|>
+<|user|>
+{prompt}
+<|end|>
+<|assistant|>"""
+            
+            print(f"\nAttempting to process r/{subreddit}...")
+            
+            # Add delay between requests
+            if attempt > 0:
+                wait_time = 2 ** attempt
+                print(f"Rate limit hit. Waiting {wait_time} seconds before retry...")
+                await asyncio.sleep(wait_time)
+            
+            response = await client.chat.completions.create(
+                model="mistral-tiny",
+                messages=[{"role": "user", "content": formatted_prompt}],
+                temperature=0.1,
+                max_tokens=100
+            )
+            
+            print(f"\nRaw response for r/{subreddit}:")
+            print(response)
+            
+            if hasattr(response, 'error'):
+                error_message = response.error.get('message', 'Unknown error')
+                if 'rate limit' in error_message.lower():
+                    print(f"Rate limit error: {error_message}")
+                    continue  # Try again after waiting
+                else:
+                    print(f"API error: {error_message}")
+                    
+            if not response or not response.choices:
+                print(f"Empty or invalid response received for r/{subreddit}")
+                continue
+            
+            # Clean up the response more strictly
+            result = response.choices[0].message.content.strip()
+            
+            # Only take lines that start with our expected prefixes and are properly formatted
+            valid_lines = []
+            for line in result.split('\n'):
+                line = line.strip()
+                if any(line.startswith(prefix) for prefix in ['MAIN_CATEGORY:', 'SUB_CATEGORY:', 'SPECIALIST:']):
+                    # Verify the line has a colon and content after it
+                    if ':' in line and line.split(':', 1)[1].strip():
+                        valid_lines.append(line)
+            
+            if len(valid_lines) == 3:
+                main_category = ""
+                sub_category = ""
+                specialist = ""
+                
+                for line in valid_lines:
+                    prefix, value = line.split(':', 1)
+                    value = value.strip()
+                    
+                    if prefix == 'MAIN_CATEGORY':
+                        main_category = value
+                    elif prefix == 'SUB_CATEGORY':
+                        if value.split('.')[0].isdigit():
+                            index = int(value.split('.')[0]) - 1
+                            if 0 <= index < len(categories['third_column']):
+                                sub_category = categories['third_column'][index]
+                        elif value.startswith('NEW:'):
+                            new_sub = value.replace('NEW:', '').strip()
+                            update_subcategories(new_sub, categories)
+                            sub_category = new_sub
+                        elif value.lower() in ['-', 'blank', 'none', 'n/a']:
+                            sub_category = ''
+                        else:
+                            sub_category = value
+                    elif prefix == 'SPECIALIST':
+                        if value.lower() not in ['-', 'blank', 'none', 'n/a']:
+                            specialist = value
+                
+                # Clean up any remaining explanations or parentheticals
+                main_category = main_category.split('(')[0].strip()
+                sub_category = sub_category.split('(')[0].strip()
+                specialist = specialist.split('(')[0].strip()
+                
+                await asyncio.sleep(1.1)  # Slightly over 1 second to be safe
+                return subreddit, main_category, sub_category, specialist
+            
+            else:
+                print(f"Invalid response format for r/{subreddit} on attempt {attempt + 1}. Retrying...")
+        
+        except Exception as e:
+            print(f"Error processing r/{subreddit} on attempt {attempt + 1}: {e}")
+        
+    print(f"Failed to get valid response for r/{subreddit} after {max_retries} attempts.")
+    return subreddit, None, None, None
 
 if __name__ == "__main__":
     main() 
