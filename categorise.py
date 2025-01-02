@@ -173,25 +173,59 @@ def update_subcategories(new_subcategory: str, categories: Dict[str, List[str]])
         print(f"Added new subcategory: {new_subcategory}")
 
 async def process_llm_batch(prompts_data: List[Tuple[str, dict, dict, str]], categories: Dict[str, List[str]]) -> List[Tuple[str, str, str, str]]:
-    """Process LLM queries one at a time"""
+    """Process LLM queries concurrently while maintaining 1 request per second rate"""
     results = []
+    tasks = []
     
-    for prompt_data in prompts_data:
-        # Process one prompt at a time
-        result = await process_single_prompt(prompt_data, categories)
-        results.append(result)
-        # Respect Mistral's 1 request per second limit
-        await asyncio.sleep(1.1)  # Slightly over 1 second to be safe
+    # Create a queue of prompts to process
+    for i, prompt_data in enumerate(prompts_data):
+        # Schedule each request 1 second apart
+        task = asyncio.create_task(
+            process_single_prompt_with_delay(prompt_data, categories, i)
+        )
+        tasks.append(task)
+    
+    # Wait for all tasks to complete and collect results
+    completed_results = await asyncio.gather(*tasks)
+    results.extend(completed_results)
     
     return results
 
+async def process_single_prompt_with_delay(prompt_data, categories, index):
+    """Process a single prompt with a delay based on its index"""
+    max_retries = 3
+    initial_delay = index
+    
+    for attempt in range(max_retries):
+        try:
+            # Wait for initial delay on first attempt, longer on retries
+            if attempt == 0:
+                await asyncio.sleep(initial_delay)
+            else:
+                retry_delay = initial_delay + (5 * attempt)  # Add 5 seconds per retry
+                print(f"Rate limit hit for r/{prompt_data[0]}. Waiting {retry_delay} seconds before retry {attempt + 1}...")
+                await asyncio.sleep(retry_delay)
+            
+            result = await process_single_prompt(prompt_data, categories)
+            
+            # If we get here, the request was successful
+            return result
+            
+        except Exception as e:
+            if 'rate limit' in str(e).lower() and attempt < max_retries - 1:
+                continue  # Try again with longer delay
+            else:
+                print(f"Failed to process r/{prompt_data[0]} after {attempt + 1} attempts: {e}")
+                return prompt_data[0], None, None, None  # Return failure result
+
 async def process_batch(reddit_api: RedditAPI, batch: List[str], categories: dict) -> dict:
-    """Process subreddits one at a time"""
+    """Process subreddits in larger batches"""
     last_rate_limits = None
     async with aiohttp.ClientSession() as session:
-        results = []
+        prompts_data = []
+        
+        # Collect data for all subreddits in batch first
         for subreddit in batch:
-            # Fetch Reddit data for one subreddit
             top_data, about_data, rate_limits = await get_reddit_data_async(reddit_api, session, subreddit)
             
             if not top_data or not about_data:
@@ -200,15 +234,15 @@ async def process_batch(reddit_api: RedditAPI, batch: List[str], categories: dic
             last_rate_limits = rate_limits
             print(f"Preparing prompt for r/{subreddit}...")
             prompt = create_prompt(subreddit, top_data, about_data, categories)
-            
-            # Process one LLM query
-            llm_result = await process_llm_batch([(subreddit, prompt, about_data)], categories)
-            results.extend(llm_result)
-            
-            # Write result to CSV
-            for result in llm_result:
-                if result[1]:  # if main_category exists
-                    await asyncio.to_thread(write_to_csv, *result)
+            prompts_data.append((subreddit, prompt, about_data))
+        
+        # Process all prompts concurrently
+        results = await process_llm_batch(prompts_data, categories)
+        
+        # Write results to CSV
+        for result in results:
+            if result[1]:  # if main_category exists
+                await asyncio.to_thread(write_to_csv, *result)
         
         return last_rate_limits
 
@@ -236,8 +270,8 @@ async def main_async():
     total_subs = len(subreddits)
     print(f"\nStarting processing of {total_subs} subreddits...")
     
-    # Process one subreddit at a time
-    batch_size = 1
+    # Process in larger batches
+    batch_size = 60  # Process 60 subreddits at a time
     
     for i in range(0, len(subreddits), batch_size):
         batch = subreddits[i:i + batch_size]
